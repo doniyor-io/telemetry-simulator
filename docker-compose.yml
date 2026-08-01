@@ -1,0 +1,12 @@
+services:
+  equipment-telemetry-simulator:
+    build: .
+    container_name: equipment-telemetry-simulator
+    environment:
+      PORT: "8080"
+      TICK_INTERVAL: "2s"
+      PUSH_MODE: "false"
+      TARGET_TOIR_URL: ""
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

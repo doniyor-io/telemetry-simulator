@@ -1,0 +1,15 @@
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+COPY go.mod ./
+COPY cmd ./cmd
+COPY internal ./internal
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/equipment-telemetry-simulator ./cmd/server
+
+FROM scratch
+
+COPY --from=builder /out/equipment-telemetry-simulator /equipment-telemetry-simulator
+
+EXPOSE 8080
+ENTRYPOINT ["/equipment-telemetry-simulator"]
