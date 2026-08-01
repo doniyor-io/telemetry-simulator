@@ -2,20 +2,13 @@
 
 Lightweight Go microservice for simulating equipment telemetry for Enterprise TOiR, MRO, EAM, and automated maintenance workflows.
 
-The service starts with five mock assets:
-
-- `PUMP-101` and `PUMP-102` as `WATER_PUMP`
-- `COMP-301` as `AIR_COMPRESSOR`
-- `GEN-401` as `DIESEL_GENERATOR`
-- `TRUCK-501` as `HEAVY_TRUCK`
 
 ## Features
 
-- In-memory, thread-safe digital twin state engine
+- Thread-safe digital twin state engine
 - Normal metric fluctuation every configurable tick interval
 - Fault injection for anomaly testing
 - Optional webhook push mode for telemetry batches
-- No runtime database or external dependencies
 - Standard library HTTP router
 
 ## Run Locally
