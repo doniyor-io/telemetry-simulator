@@ -1,0 +1,5 @@
+.idea
+.env
+.DS_Store
+CLAUDE.md
+AGENT.md

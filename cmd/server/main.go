@@ -20,6 +20,23 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
+	db, err := handler.DbConnect()
+	if err != nil {
+		logger.Error("database connection failed", "error", err)
+		os.Exit(1)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		logger.Error("database handle unavailable", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := sqlDB.Close(); err != nil {
+			logger.Warn("database close failed", "error", err)
+		}
+	}()
+
 	tickInterval := durationFromEnv("TICK_INTERVAL", 2*time.Second)
 	pushInterval := durationFromEnv("PUSH_INTERVAL", tickInterval)
 
@@ -33,13 +50,18 @@ func main() {
 		pushClient = simulator.NewPushClient(targetURL)
 	}
 
-	manager := simulator.NewManager(simulator.Config{
+	manager, err := simulator.NewManager(db, simulator.Config{
 		TickInterval: tickInterval,
 		PushClient:   pushClient,
 		PushInterval: pushInterval,
 		Logger:       logger,
 	})
-	registerSeedAssets(manager, logger)
+	if err != nil {
+		logger.Error("manager initialization failed", "error", err)
+		os.Exit(1)
+	}
+
+	seedDefaults(manager, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -70,21 +92,49 @@ func main() {
 	logger.Info("server stopped")
 }
 
-func registerSeedAssets(manager *simulator.Manager, logger *slog.Logger) {
-	seedAssets := []struct {
-		id        string
-		assetType model.AssetType
-	}{
-		{id: "PUMP-101", assetType: model.AssetTypeWaterPump},
-		{id: "PUMP-102", assetType: model.AssetTypeWaterPump},
-		{id: "COMP-301", assetType: model.AssetTypeAirCompressor},
-		{id: "GEN-401", assetType: model.AssetTypeDieselGenerator},
-		{id: "TRUCK-501", assetType: model.AssetTypeHeavyTruck},
+func seedDefaults(manager *simulator.Manager, logger *slog.Logger) {
+	defaultTypes := []model.AssetTypeDefinition{
+		{
+			ID:          "WATER_PUMP",
+			Name:        "Water Pump",
+			Description: "Industrial pump with pressure and temperature telemetry",
+			Metrics: model.MetricDefinitions{
+				{Name: "temperature_c", Unit: "C", Min: 50, Max: 75, Drift: 1.2},
+				{Name: "pressure_bar", Unit: "bar", Min: 3.5, Max: 4.5, Drift: 0.12},
+			},
+			FaultTypes: []string{"OVERHEATING", "LOW_PRESSURE", "HIGH_PRESSURE"},
+		},
+		{
+			ID:          "COMPRESSOR",
+			Name:        "Air Compressor",
+			Description: "Compressor reporting temperature, pressure, and output volume",
+			Metrics: model.MetricDefinitions{
+				{Name: "temperature_c", Unit: "C", Min: 60, Max: 85, Drift: 1.5},
+				{Name: "pressure_psi", Unit: "psi", Min: 90, Max: 120, Drift: 2.5},
+				{Name: "volume_m3_min", Unit: "m3/min", Min: 8, Max: 14, Drift: 0.5},
+			},
+			FaultTypes: []string{"OVERHEATING", "PRESSURE_DROP", "VOLUME_DROP"},
+		},
 	}
 
-	for _, asset := range seedAssets {
-		if _, err := manager.RegisterAsset(asset.id, asset.assetType); err != nil {
-			logger.Warn("seed asset registration skipped", "assetId", asset.id, "error", err)
+	for _, definition := range defaultTypes {
+		if _, err := manager.CreateAssetType(definition); err != nil {
+			logger.Debug("seed asset type skipped", "assetTypeId", definition.ID, "error", err)
+		}
+	}
+
+	defaultAssets := []struct {
+		assetID     string
+		assetTypeID string
+	}{
+		{assetID: "PUMP-101", assetTypeID: "WATER_PUMP"},
+		{assetID: "PUMP-102", assetTypeID: "WATER_PUMP"},
+		{assetID: "COMP-301", assetTypeID: "COMPRESSOR"},
+	}
+
+	for _, asset := range defaultAssets {
+		if _, err := manager.RegisterAsset(asset.assetID, asset.assetTypeID); err != nil {
+			logger.Debug("seed asset skipped", "assetId", asset.assetID, "error", err)
 		}
 	}
 }

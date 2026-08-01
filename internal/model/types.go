@@ -1,95 +1,169 @@
 package model
 
-import "time"
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
 
-type AssetType string
-
-const (
-	AssetTypeWaterPump       AssetType = "WATER_PUMP"
-	AssetTypeAirCompressor   AssetType = "AIR_COMPRESSOR"
-	AssetTypeDieselGenerator AssetType = "DIESEL_GENERATOR"
-	AssetTypeHeavyTruck      AssetType = "HEAVY_TRUCK"
+	"github.com/lib/pq"
 )
+
+type MetricDefinition struct {
+	Name  string  `json:"name" gorm:"not null"`
+	Unit  string  `json:"unit" gorm:"not null"`
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+	Drift float64 `json:"drift"`
+}
+
+type MetricDefinitions []MetricDefinition
+
+func (m MetricDefinitions) Value() (driver.Value, error) {
+	if m == nil {
+		return []byte("[]"), nil
+	}
+	return json.Marshal(m)
+}
+
+func (m *MetricDefinitions) Scan(value any) error {
+	if value == nil {
+		*m = MetricDefinitions{}
+		return nil
+	}
+
+	var raw []byte
+	switch v := value.(type) {
+	case []byte:
+		raw = v
+	case string:
+		raw = []byte(v)
+	default:
+		return fmt.Errorf("scan metric definitions: unsupported type %T", value)
+	}
+
+	if len(raw) == 0 {
+		*m = MetricDefinitions{}
+		return nil
+	}
+	return json.Unmarshal(raw, m)
+}
+
+type AssetTypeDefinition struct {
+	ID          string            `json:"id" gorm:"primaryKey;type:varchar(80);column:id"`
+	Name        string            `json:"name" gorm:"not null;type:varchar(160)"`
+	Description string            `json:"description" gorm:"type:text"`
+	Metrics     MetricDefinitions `json:"metrics" gorm:"type:jsonb;not null;default:'[]'"`
+	FaultTypes  pq.StringArray    `json:"faultTypes" gorm:"type:text[];not null;default:'{}'"`
+	CreatedAt   time.Time         `json:"createdAt" gorm:"autoCreateTime"`
+	UpdatedAt   time.Time         `json:"updatedAt" gorm:"autoUpdateTime"`
+}
 
 type AssetStatus string
 
 const (
 	AssetStatusRunning AssetStatus = "RUNNING"
-	AssetStatusStopped AssetStatus = "STOPPED"
 	AssetStatusFault   AssetStatus = "FAULT"
+	AssetStatusStopped AssetStatus = "STOPPED"
 )
-
-type FaultType string
-
-const (
-	FaultTypeHighVibration FaultType = "HIGH_VIBRATION"
-	FaultTypeOverheating   FaultType = "OVERHEATING"
-	FaultTypeLowPressure   FaultType = "LOW_PRESSURE"
-	FaultTypeFuelLeak      FaultType = "FUEL_LEAK"
-	FaultTypePowerSurge    FaultType = "POWER_SURGE"
-)
-
-type MetricDefinition struct {
-	Name   string  `json:"name"`
-	Unit   string  `json:"unit"`
-	Min    float64 `json:"min"`
-	Max    float64 `json:"max"`
-	Sticky bool    `json:"sticky,omitempty"`
-	Drift  float64 `json:"drift,omitempty"`
-}
 
 type MetricValue struct {
 	Value float64 `json:"value"`
 	Unit  string  `json:"unit"`
 }
 
+type MetricsMap map[string]MetricValue
+
+func (m MetricsMap) Value() (driver.Value, error) {
+	if m == nil {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(m)
+}
+
+func (m *MetricsMap) Scan(value any) error {
+	if value == nil {
+		*m = MetricsMap{}
+		return nil
+	}
+
+	var raw []byte
+	switch v := value.(type) {
+	case []byte:
+		raw = v
+	case string:
+		raw = []byte(v)
+	default:
+		return fmt.Errorf("scan metrics map: unsupported type %T", value)
+	}
+
+	if len(raw) == 0 {
+		*m = MetricsMap{}
+		return nil
+	}
+	return json.Unmarshal(raw, m)
+}
+
 type Asset struct {
-	AssetID      string                 `json:"assetId"`
-	AssetType    AssetType              `json:"assetType"`
-	Status       AssetStatus            `json:"status"`
-	Metrics      map[string]MetricValue `json:"metrics"`
-	ActiveFaults []FaultType            `json:"activeFaults"`
-	UpdatedAt    time.Time              `json:"updatedAt"`
+	AssetID      string         `json:"assetId" gorm:"primaryKey;type:varchar(120);column:asset_id"`
+	AssetTypeID  string         `json:"assetTypeId" gorm:"not null;type:varchar(80);index;column:asset_type_id"`
+	Status       AssetStatus    `json:"status" gorm:"type:varchar(20);not null;default:'RUNNING'"`
+	Metrics      MetricsMap     `json:"metrics" gorm:"type:jsonb;not null;default:'{}'"`
+	ActiveFaults pq.StringArray `json:"activeFaults" gorm:"type:text[];not null;default:'{}';column:active_faults"`
+	UpdatedAt    time.Time      `json:"updatedAt" gorm:"autoUpdateTime"`
+}
+
+type CreateAssetTypeRequest struct {
+	ID          *string             `json:"id"`
+	Name        *string             `json:"name"`
+	Description *string             `json:"description,omitempty"`
+	Metrics     *[]MetricDefinition `json:"metrics"`
+	FaultTypes  *[]string           `json:"faultTypes,omitempty"`
 }
 
 type RegisterAssetRequest struct {
-	AssetID   string    `json:"assetId"`
-	AssetType AssetType `json:"assetType"`
-}
-
-type UpdateAssetRequest struct {
-	AssetID   string                 `json:"assetId,omitempty"`
-	AssetType AssetType              `json:"assetType"`
-	Status    AssetStatus            `json:"status"`
-	Metrics   map[string]MetricValue `json:"metrics,omitempty"`
-}
-
-type PatchAssetRequest struct {
-	AssetType *AssetType              `json:"assetType,omitempty"`
-	Status    *AssetStatus            `json:"status,omitempty"`
-	Metrics   map[string]*MetricValue `json:"metrics,omitempty"`
-}
-
-type InjectFaultRequest struct {
-	AssetID   string    `json:"assetId"`
-	FaultType FaultType `json:"faultType"`
+	AssetID     *string `json:"assetId"`
+	AssetTypeID *string `json:"assetTypeId"`
 }
 
 type ReplaceFaultsRequest struct {
-	AssetID    string      `json:"assetId,omitempty"`
-	FaultTypes []FaultType `json:"faultTypes"`
-}
-
-type PatchFaultsRequest struct {
-	AssetID string      `json:"assetId,omitempty"`
-	Add     []FaultType `json:"add,omitempty"`
-	Remove  []FaultType `json:"remove,omitempty"`
-}
-
-type ClearFaultRequest struct {
-	AssetID string `json:"assetId"`
+	FaultTypes *[]string `json:"faultTypes"`
 }
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+func (s AssetStatus) Valid() bool {
+	switch s {
+	case AssetStatusRunning, AssetStatusFault, AssetStatusStopped:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidateMetricDefinitions(metrics []MetricDefinition) error {
+	if len(metrics) == 0 {
+		return errors.New("metrics must contain at least one metric definition")
+	}
+
+	seen := make(map[string]struct{}, len(metrics))
+	for _, metric := range metrics {
+		if metric.Name == "" {
+			return errors.New("metric name is required")
+		}
+		if metric.Unit == "" {
+			return fmt.Errorf("metric %q unit is required", metric.Name)
+		}
+		if metric.Min >= metric.Max {
+			return fmt.Errorf("metric %q min must be less than max", metric.Name)
+		}
+		if _, exists := seen[metric.Name]; exists {
+			return fmt.Errorf("duplicate metric definition %q", metric.Name)
+		}
+		seen[metric.Name] = struct{}{}
+	}
+	return nil
 }

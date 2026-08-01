@@ -7,24 +7,29 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
 	"equipment-telemetry-simulator/internal/model"
+
+	"gorm.io/gorm"
 )
 
 var (
 	ErrAssetExists       = errors.New("asset already exists")
 	ErrAssetNotFound     = errors.New("asset not found")
+	ErrAssetTypeExists   = errors.New("asset type already exists")
+	ErrAssetTypeNotFound = errors.New("asset type not found")
 	ErrUnsupportedFault  = errors.New("unsupported fault type")
-	ErrUnsupportedAsset  = errors.New("unsupported asset type")
-	ErrUnsupportedStatus = errors.New("unsupported asset status")
 	ErrMissingIdentifier = errors.New("assetId is required")
 	ErrInvalidRequest    = errors.New("invalid request")
 )
 
 type Manager struct {
 	mu          sync.RWMutex
+	db          *gorm.DB
+	assetTypes  map[string]model.AssetTypeDefinition
 	assets      map[string]*model.Asset
 	tick        time.Duration
 	rng         *rand.Rand
@@ -41,21 +46,29 @@ type Config struct {
 	Logger       *slog.Logger
 }
 
-func NewManager(cfg Config) *Manager {
+func NewManager(db *gorm.DB, cfg Config) (*Manager, error) {
+	if db == nil {
+		return nil, errors.New("gorm DB is required")
+	}
+
 	tick := cfg.TickInterval
 	if tick <= 0 {
 		tick = 2 * time.Second
 	}
+
 	pushEvery := cfg.PushInterval
 	if pushEvery <= 0 {
 		pushEvery = tick
 	}
+
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	return &Manager{
+	manager := &Manager{
+		db:          db,
+		assetTypes:  make(map[string]model.AssetTypeDefinition),
 		assets:      make(map[string]*model.Asset),
 		tick:        tick,
 		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
@@ -64,6 +77,39 @@ func NewManager(cfg Config) *Manager {
 		pushEvery:   pushEvery,
 		roundDigits: 2,
 	}
+
+	if err := manager.loadFromDB(); err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+func (m *Manager) loadFromDB() error {
+	var assetTypes []model.AssetTypeDefinition
+	if err := m.db.Find(&assetTypes).Error; err != nil {
+		return fmt.Errorf("load asset type definitions: %w", err)
+	}
+
+	var assets []model.Asset
+	if err := m.db.Find(&assets).Error; err != nil {
+		return fmt.Errorf("load assets: %w", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, assetType := range assetTypes {
+		m.assetTypes[assetType.ID] = assetType
+	}
+	for i := range assets {
+		asset := assets[i]
+		asset.ActiveFaults = dedupeStrings(asset.ActiveFaults)
+		if asset.Metrics == nil {
+			asset.Metrics = model.MetricsMap{}
+		}
+		m.assets[asset.AssetID] = &asset
+	}
+	return nil
 }
 
 func (m *Manager) Start(ctx context.Context) {
@@ -73,38 +119,78 @@ func (m *Manager) Start(ctx context.Context) {
 	}
 }
 
-func (m *Manager) RegisterAsset(assetID string, assetType model.AssetType) (model.Asset, error) {
+func (m *Manager) CreateAssetType(def model.AssetTypeDefinition) (model.AssetTypeDefinition, error) {
+	def.ID = strings.TrimSpace(def.ID)
+	def.Name = strings.TrimSpace(def.Name)
+	if def.ID == "" {
+		return model.AssetTypeDefinition{}, fmt.Errorf("%w: asset type id is required", ErrInvalidRequest)
+	}
+	if def.Name == "" {
+		return model.AssetTypeDefinition{}, fmt.Errorf("%w: asset type name is required", ErrInvalidRequest)
+	}
+	if err := model.ValidateMetricDefinitions(def.Metrics); err != nil {
+		return model.AssetTypeDefinition{}, fmt.Errorf("%w: %s", ErrInvalidRequest, err)
+	}
+	def.FaultTypes = dedupeStrings(def.FaultTypes)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.assetTypes[def.ID]; exists {
+		return model.AssetTypeDefinition{}, ErrAssetTypeExists
+	}
+
+	if err := m.db.Create(&def).Error; err != nil {
+		return model.AssetTypeDefinition{}, fmt.Errorf("create asset type definition: %w", err)
+	}
+	m.assetTypes[def.ID] = def
+	return def, nil
+}
+
+func (m *Manager) ListAssetTypes() []model.AssetTypeDefinition {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	definitions := make([]model.AssetTypeDefinition, 0, len(m.assetTypes))
+	for _, definition := range m.assetTypes {
+		definitions = append(definitions, definition)
+	}
+	return definitions
+}
+
+func (m *Manager) RegisterAsset(assetID, assetTypeID string) (model.Asset, error) {
+	assetID = strings.TrimSpace(assetID)
+	assetTypeID = strings.TrimSpace(assetTypeID)
 	if assetID == "" {
 		return model.Asset{}, ErrMissingIdentifier
 	}
-	template, err := TemplateFor(assetType)
-	if err != nil {
-		return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedAsset, assetType)
+	if assetTypeID == "" {
+		return model.Asset{}, fmt.Errorf("%w: assetTypeId is required", ErrInvalidRequest)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	assetType, ok := m.assetTypes[assetTypeID]
+	if !ok {
+		return model.Asset{}, fmt.Errorf("%w: %s", ErrAssetTypeNotFound, assetTypeID)
+	}
 	if _, exists := m.assets[assetID]; exists {
 		return model.Asset{}, ErrAssetExists
 	}
 
 	asset := &model.Asset{
 		AssetID:      assetID,
-		AssetType:    assetType,
+		AssetTypeID:  assetTypeID,
 		Status:       model.AssetStatusRunning,
-		Metrics:      make(map[string]model.MetricValue, len(template.Metrics)),
-		ActiveFaults: []model.FaultType{},
+		Metrics:      m.initialMetricsLocked(assetType),
+		ActiveFaults: []string{},
 		UpdatedAt:    time.Now().UTC(),
 	}
-	for _, metric := range template.Metrics {
-		value := m.randomBetween(metric.Min, metric.Max)
-		if metric.Sticky {
-			value = metric.Max
-		}
-		asset.Metrics[metric.Name] = model.MetricValue{Value: m.round(value), Unit: metric.Unit}
-	}
 
+	if err := m.db.Create(asset).Error; err != nil {
+		return model.Asset{}, fmt.Errorf("create asset: %w", err)
+	}
 	m.assets[assetID] = asset
 	return cloneAsset(asset), nil
 }
@@ -120,69 +206,8 @@ func (m *Manager) ListAssets() []model.Asset {
 	return assets
 }
 
-func (m *Manager) GetAsset(assetID string) (model.Asset, error) {
-	return m.GetTelemetry(assetID)
-}
-
-func (m *Manager) GetTelemetry(assetID string) (model.Asset, error) {
-	if assetID == "" {
-		return model.Asset{}, ErrMissingIdentifier
-	}
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	asset, ok := m.assets[assetID]
-	if !ok {
-		return model.Asset{}, ErrAssetNotFound
-	}
-	return cloneAsset(asset), nil
-}
-
-func (m *Manager) ReplaceAsset(assetID string, req model.UpdateAssetRequest) (model.Asset, error) {
-	if assetID == "" {
-		return model.Asset{}, ErrMissingIdentifier
-	}
-	if req.AssetID != "" && req.AssetID != assetID {
-		return model.Asset{}, fmt.Errorf("%w: path assetId %q does not match body assetId %q", ErrInvalidRequest, assetID, req.AssetID)
-	}
-	if !isSupportedStatus(req.Status) {
-		return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedStatus, req.Status)
-	}
-	template, err := TemplateFor(req.AssetType)
-	if err != nil {
-		return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedAsset, req.AssetType)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	asset, ok := m.assets[assetID]
-	if !ok {
-		return model.Asset{}, ErrAssetNotFound
-	}
-
-	asset.AssetType = req.AssetType
-	asset.Status = req.Status
-	asset.Metrics = m.initialMetricsLocked(template)
-	for metricName, metric := range req.Metrics {
-		if isKnownMetric(template, metricName) {
-			asset.Metrics[metricName] = metric
-		}
-	}
-	if req.Status != model.AssetStatusFault {
-		asset.ActiveFaults = []model.FaultType{}
-	}
-	if len(asset.ActiveFaults) > 0 {
-		asset.Status = model.AssetStatusFault
-		m.applyFaultsLocked(asset)
-	}
-	asset.UpdatedAt = time.Now().UTC()
-
-	return cloneAsset(asset), nil
-}
-
-func (m *Manager) PatchAsset(assetID string, req model.PatchAssetRequest) (model.Asset, error) {
+func (m *Manager) ReplaceFaults(assetID string, faultTypes []string) (model.Asset, error) {
+	assetID = strings.TrimSpace(assetID)
 	if assetID == "" {
 		return model.Asset{}, ErrMissingIdentifier
 	}
@@ -194,200 +219,32 @@ func (m *Manager) PatchAsset(assetID string, req model.PatchAssetRequest) (model
 	if !ok {
 		return model.Asset{}, ErrAssetNotFound
 	}
-
-	if req.AssetType != nil && *req.AssetType != asset.AssetType {
-		template, err := TemplateFor(*req.AssetType)
-		if err != nil {
-			return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedAsset, *req.AssetType)
-		}
-		asset.AssetType = *req.AssetType
-		asset.Metrics = m.initialMetricsLocked(template)
-		asset.ActiveFaults = []model.FaultType{}
-	}
-
-	if req.Status != nil {
-		if !isSupportedStatus(*req.Status) {
-			return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedStatus, *req.Status)
-		}
-		asset.Status = *req.Status
-		if *req.Status != model.AssetStatusFault {
-			asset.ActiveFaults = []model.FaultType{}
-		}
-	}
-
-	template, err := TemplateFor(asset.AssetType)
-	if err != nil {
-		return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedAsset, asset.AssetType)
-	}
-	for metricName, metric := range req.Metrics {
-		if metric == nil || !isKnownMetric(template, metricName) {
-			continue
-		}
-		asset.Metrics[metricName] = *metric
-	}
-
-	if len(asset.ActiveFaults) > 0 {
-		asset.Status = model.AssetStatusFault
-		m.applyFaultsLocked(asset)
-	}
-	asset.UpdatedAt = time.Now().UTC()
-
-	return cloneAsset(asset), nil
-}
-
-func (m *Manager) DeleteAsset(assetID string) error {
-	if assetID == "" {
-		return ErrMissingIdentifier
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, ok := m.assets[assetID]; !ok {
-		return ErrAssetNotFound
-	}
-	delete(m.assets, assetID)
-	return nil
-}
-
-func (m *Manager) InjectFault(assetID string, faultType model.FaultType) (model.Asset, error) {
-	if assetID == "" {
-		return model.Asset{}, ErrMissingIdentifier
-	}
-	if !isSupportedFault(faultType) {
-		return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedFault, faultType)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	asset, ok := m.assets[assetID]
+	assetType, ok := m.assetTypes[asset.AssetTypeID]
 	if !ok {
-		return model.Asset{}, ErrAssetNotFound
+		return model.Asset{}, fmt.Errorf("%w: %s", ErrAssetTypeNotFound, asset.AssetTypeID)
 	}
 
-	if !hasFault(asset, faultType) {
-		asset.ActiveFaults = append(asset.ActiveFaults, faultType)
-	}
-	asset.Status = model.AssetStatusFault
-	m.applyFaultsLocked(asset)
-	asset.UpdatedAt = time.Now().UTC()
-
-	return cloneAsset(asset), nil
-}
-
-func (m *Manager) ListFaults(assetID string) ([]model.FaultType, error) {
-	asset, err := m.GetAsset(assetID)
-	if err != nil {
-		return nil, err
-	}
-	return asset.ActiveFaults, nil
-}
-
-func (m *Manager) ReplaceFaults(assetID string, faultTypes []model.FaultType) (model.Asset, error) {
-	if assetID == "" {
-		return model.Asset{}, ErrMissingIdentifier
-	}
+	faultTypes = dedupeStrings(faultTypes)
 	for _, faultType := range faultTypes {
-		if !isSupportedFault(faultType) {
+		if !stringInSlice(faultType, assetType.FaultTypes) {
 			return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedFault, faultType)
 		}
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	asset, ok := m.assets[assetID]
-	if !ok {
-		return model.Asset{}, ErrAssetNotFound
-	}
-
-	asset.ActiveFaults = dedupeFaults(faultTypes)
-	if len(asset.ActiveFaults) == 0 {
+	asset.ActiveFaults = faultTypes
+	if len(faultTypes) == 0 {
 		asset.Status = model.AssetStatusRunning
-		m.tickAssetLocked(asset)
+		m.restoreNormalMetricsLocked(asset, assetType)
 	} else {
 		asset.Status = model.AssetStatusFault
-		m.restoreNormalMetricsLocked(asset)
-		m.applyFaultsLocked(asset)
+		m.restoreNormalMetricsLocked(asset, assetType)
+		m.applyFaultsLocked(asset, assetType)
 	}
 	asset.UpdatedAt = time.Now().UTC()
 
-	return cloneAsset(asset), nil
-}
-
-func (m *Manager) PatchFaults(assetID string, addFaults, removeFaults []model.FaultType) (model.Asset, error) {
-	if assetID == "" {
-		return model.Asset{}, ErrMissingIdentifier
+	if err := m.db.Save(asset).Error; err != nil {
+		return model.Asset{}, fmt.Errorf("save asset faults: %w", err)
 	}
-	for _, faultType := range append(addFaults, removeFaults...) {
-		if !isSupportedFault(faultType) {
-			return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedFault, faultType)
-		}
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	asset, ok := m.assets[assetID]
-	if !ok {
-		return model.Asset{}, ErrAssetNotFound
-	}
-
-	removeSet := make(map[model.FaultType]struct{}, len(removeFaults))
-	for _, faultType := range removeFaults {
-		removeSet[faultType] = struct{}{}
-	}
-
-	next := make([]model.FaultType, 0, len(asset.ActiveFaults)+len(addFaults))
-	for _, faultType := range asset.ActiveFaults {
-		if _, remove := removeSet[faultType]; !remove {
-			next = append(next, faultType)
-		}
-	}
-	next = append(next, addFaults...)
-	asset.ActiveFaults = dedupeFaults(next)
-
-	if len(asset.ActiveFaults) == 0 {
-		asset.Status = model.AssetStatusRunning
-		m.tickAssetLocked(asset)
-	} else {
-		asset.Status = model.AssetStatusFault
-		m.restoreNormalMetricsLocked(asset)
-		m.applyFaultsLocked(asset)
-	}
-	asset.UpdatedAt = time.Now().UTC()
-
-	return cloneAsset(asset), nil
-}
-
-func (m *Manager) DeleteFault(assetID string, faultType model.FaultType) (model.Asset, error) {
-	if faultType == "" {
-		return m.ClearFaults(assetID)
-	}
-	if !isSupportedFault(faultType) {
-		return model.Asset{}, fmt.Errorf("%w: %s", ErrUnsupportedFault, faultType)
-	}
-	return m.PatchFaults(assetID, nil, []model.FaultType{faultType})
-}
-
-func (m *Manager) ClearFaults(assetID string) (model.Asset, error) {
-	if assetID == "" {
-		return model.Asset{}, ErrMissingIdentifier
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	asset, ok := m.assets[assetID]
-	if !ok {
-		return model.Asset{}, ErrAssetNotFound
-	}
-	asset.ActiveFaults = []model.FaultType{}
-	asset.Status = model.AssetStatusRunning
-	m.tickAssetLocked(asset)
-	asset.UpdatedAt = time.Now().UTC()
-
 	return cloneAsset(asset), nil
 }
 
@@ -400,7 +257,9 @@ func (m *Manager) runTicker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.tickAll()
+			if err := m.step(); err != nil {
+				m.logger.Warn("simulation tick failed", "error", err)
+			}
 		}
 	}
 }
@@ -421,178 +280,176 @@ func (m *Manager) runPusher(ctx context.Context) {
 	}
 }
 
-func (m *Manager) tickAll() {
+func (m *Manager) step() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	changed := make([]*model.Asset, 0, len(m.assets))
+	now := time.Now().UTC()
 	for _, asset := range m.assets {
-		m.tickAssetLocked(asset)
-		asset.UpdatedAt = time.Now().UTC()
-	}
-}
+		if asset.Status == model.AssetStatusStopped {
+			continue
+		}
 
-func (m *Manager) tickAssetLocked(asset *model.Asset) {
-	if asset.Status == model.AssetStatusStopped {
-		return
-	}
-	if len(asset.ActiveFaults) > 0 {
-		asset.Status = model.AssetStatusFault
-		m.applyFaultsLocked(asset)
-		return
-	}
-
-	asset.Status = model.AssetStatusRunning
-	template, err := TemplateFor(asset.AssetType)
-	if err != nil {
-		return
-	}
-
-	for _, metric := range template.Metrics {
-		current, ok := asset.Metrics[metric.Name]
+		assetType, ok := m.assetTypes[asset.AssetTypeID]
 		if !ok {
-			current = model.MetricValue{Unit: metric.Unit}
+			m.logger.Warn("asset type missing for asset", "assetId", asset.AssetID, "assetTypeId", asset.AssetTypeID)
+			continue
 		}
 
-		var next float64
-		if metric.Sticky {
-			next = current.Value + metric.Drift + m.randomBetween(-0.1, 0.1)
-			if next <= metric.Min {
-				next = metric.Max
-			}
-		} else {
-			span := metric.Max - metric.Min
-			delta := m.randomBetween(-span*0.08, span*0.08)
-			next = current.Value + delta
-			if next < metric.Min || next > metric.Max {
-				next = m.randomBetween(metric.Min, metric.Max)
+		m.tickAssetLocked(asset, assetType)
+		if asset.Status == model.AssetStatusFault {
+			m.applyFaultsLocked(asset, assetType)
+		}
+		asset.UpdatedAt = now
+		changed = append(changed, asset)
+	}
+
+	if len(changed) == 0 {
+		return nil
+	}
+
+	return m.db.Transaction(func(tx *gorm.DB) error {
+		for _, asset := range changed {
+			if err := tx.Model(&model.Asset{}).
+				Where("asset_id = ?", asset.AssetID).
+				Updates(map[string]any{
+					"status":        asset.Status,
+					"metrics":       asset.Metrics,
+					"active_faults": asset.ActiveFaults,
+					"updated_at":    asset.UpdatedAt,
+				}).Error; err != nil {
+				return fmt.Errorf("update asset %s: %w", asset.AssetID, err)
 			}
 		}
-		asset.Metrics[metric.Name] = model.MetricValue{Value: m.round(next), Unit: metric.Unit}
+		return nil
+	})
+}
+
+func (m *Manager) tickAssetLocked(asset *model.Asset, assetType model.AssetTypeDefinition) {
+	if asset.Metrics == nil {
+		asset.Metrics = model.MetricsMap{}
+	}
+
+	for _, definition := range assetType.Metrics {
+		current, ok := asset.Metrics[definition.Name]
+		if !ok {
+			current = model.MetricValue{
+				Value: m.randomBetween(definition.Min, definition.Max),
+				Unit:  definition.Unit,
+			}
+		}
+
+		drift := definition.Drift
+		if drift <= 0 {
+			drift = (definition.Max - definition.Min) * 0.05
+		}
+
+		next := current.Value + m.randomBetween(-drift, drift)
+		if next < definition.Min || next > definition.Max {
+			next = m.randomBetween(definition.Min, definition.Max)
+		}
+
+		asset.Metrics[definition.Name] = model.MetricValue{
+			Value: m.round(next),
+			Unit:  definition.Unit,
+		}
 	}
 }
 
-func (m *Manager) initialMetricsLocked(template AssetTemplate) map[string]model.MetricValue {
-	metrics := make(map[string]model.MetricValue, len(template.Metrics))
-	for _, metric := range template.Metrics {
-		value := m.randomBetween(metric.Min, metric.Max)
-		if metric.Sticky {
-			value = metric.Max
+func (m *Manager) applyFaultsLocked(asset *model.Asset, assetType model.AssetTypeDefinition) {
+	if len(assetType.Metrics) == 0 {
+		return
+	}
+
+	for _, faultType := range asset.ActiveFaults {
+		upperFault := strings.ToUpper(faultType)
+		applied := false
+
+		for _, metric := range assetType.Metrics {
+			metricName := strings.ToUpper(metric.Name)
+			drift := metric.Drift
+			if drift <= 0 {
+				drift = math.Max((metric.Max-metric.Min)*0.2, 1)
+			}
+
+			switch {
+			case strings.Contains(upperFault, "OVERHEAT") && strings.Contains(metricName, "TEMP"):
+				m.setMetric(asset, metric, metric.Max+drift*4)
+				applied = true
+			case strings.Contains(upperFault, "LOW_PRESSURE") && strings.Contains(metricName, "PRESSURE"):
+				m.setMetric(asset, metric, metric.Min-drift*4)
+				applied = true
+			case strings.Contains(upperFault, "PRESSURE_DROP") && strings.Contains(metricName, "PRESSURE"):
+				m.setMetric(asset, metric, metric.Min-drift*4)
+				applied = true
+			case strings.Contains(upperFault, "HIGH_PRESSURE") && strings.Contains(metricName, "PRESSURE"):
+				m.setMetric(asset, metric, metric.Max+drift*4)
+				applied = true
+			case strings.Contains(upperFault, "SURGE") && (strings.Contains(metricName, "VOLT") || strings.Contains(metricName, "RPM")):
+				m.setMetric(asset, metric, metric.Max+drift*5)
+				applied = true
+			case strings.Contains(upperFault, "LEAK") && (strings.Contains(metricName, "FUEL") || strings.Contains(metricName, "FLOW") || strings.Contains(metricName, "VOLUME")):
+				m.setMetric(asset, metric, metric.Min-drift*3)
+				applied = true
+			case strings.Contains(upperFault, "VIBRATION") && strings.Contains(metricName, "VIBRATION"):
+				m.setMetric(asset, metric, metric.Max+drift*6)
+				applied = true
+			}
 		}
-		metrics[metric.Name] = model.MetricValue{Value: m.round(value), Unit: metric.Unit}
+
+		if !applied {
+			metric := assetType.Metrics[0]
+			drift := metric.Drift
+			if drift <= 0 {
+				drift = math.Max((metric.Max-metric.Min)*0.2, 1)
+			}
+			m.setMetric(asset, metric, metric.Max+drift*3)
+		}
+	}
+}
+
+func (m *Manager) restoreNormalMetricsLocked(asset *model.Asset, assetType model.AssetTypeDefinition) {
+	if asset.Metrics == nil {
+		asset.Metrics = model.MetricsMap{}
+	}
+
+	for _, definition := range assetType.Metrics {
+		current, ok := asset.Metrics[definition.Name]
+		if !ok || current.Value < definition.Min || current.Value > definition.Max {
+			current = model.MetricValue{
+				Value: m.randomBetween(definition.Min, definition.Max),
+				Unit:  definition.Unit,
+			}
+		}
+		current.Unit = definition.Unit
+		current.Value = m.round(current.Value)
+		asset.Metrics[definition.Name] = current
+	}
+}
+
+func (m *Manager) initialMetricsLocked(assetType model.AssetTypeDefinition) model.MetricsMap {
+	metrics := make(model.MetricsMap, len(assetType.Metrics))
+	for _, definition := range assetType.Metrics {
+		metrics[definition.Name] = model.MetricValue{
+			Value: m.round(m.randomBetween(definition.Min, definition.Max)),
+			Unit:  definition.Unit,
+		}
 	}
 	return metrics
 }
 
-func (m *Manager) restoreNormalMetricsLocked(asset *model.Asset) {
-	template, err := TemplateFor(asset.AssetType)
-	if err != nil {
-		return
+func (m *Manager) setMetric(asset *model.Asset, definition model.MetricDefinition, value float64) {
+	asset.Metrics[definition.Name] = model.MetricValue{
+		Value: m.round(value),
+		Unit:  definition.Unit,
 	}
-
-	for _, metric := range template.Metrics {
-		current, ok := asset.Metrics[metric.Name]
-		if !ok || current.Value < metric.Min || current.Value > metric.Max {
-			value := m.randomBetween(metric.Min, metric.Max)
-			if metric.Sticky {
-				value = metric.Max
-			}
-			asset.Metrics[metric.Name] = model.MetricValue{Value: m.round(value), Unit: metric.Unit}
-			continue
-		}
-		current.Unit = metric.Unit
-		asset.Metrics[metric.Name] = current
-	}
-}
-
-func (m *Manager) applyFaultsLocked(asset *model.Asset) {
-	for _, fault := range asset.ActiveFaults {
-		switch fault {
-		case model.FaultTypeHighVibration:
-			setIfPresent(asset, "vibration_mms", 6.5)
-		case model.FaultTypeOverheating:
-			setIfPresent(asset, "motor_temp_c", 120)
-			setIfPresent(asset, "oil_temp_c", 120)
-			setIfPresent(asset, "coolant_temp_c", 120)
-			setIfPresent(asset, "engine_temp_c", 120)
-		case model.FaultTypeLowPressure:
-			setIfPresent(asset, "water_pressure_bar", 1.1)
-			setIfPresent(asset, "air_pressure_psi", 45)
-			setIfPresent(asset, "flow_rate_lpm", 40)
-		case model.FaultTypeFuelLeak:
-			setIfPresent(asset, "fuel_level_pct", 5)
-			setIfPresent(asset, "fuel_level_liters", 25)
-		case model.FaultTypePowerSurge:
-			setIfPresent(asset, "voltage_v", 460)
-			setIfPresent(asset, "frequency_hz", 58)
-			setIfPresent(asset, "motor_rpm", 1850)
-			setIfPresent(asset, "engine_rpm", 2800)
-		}
-	}
-}
-
-func isSupportedFault(faultType model.FaultType) bool {
-	switch faultType {
-	case model.FaultTypeHighVibration,
-		model.FaultTypeOverheating,
-		model.FaultTypeLowPressure,
-		model.FaultTypeFuelLeak,
-		model.FaultTypePowerSurge:
-		return true
-	default:
-		return false
-	}
-}
-
-func isSupportedStatus(status model.AssetStatus) bool {
-	switch status {
-	case model.AssetStatusRunning, model.AssetStatusStopped, model.AssetStatusFault:
-		return true
-	default:
-		return false
-	}
-}
-
-func isKnownMetric(template AssetTemplate, metricName string) bool {
-	for _, metric := range template.Metrics {
-		if metric.Name == metricName {
-			return true
-		}
-	}
-	return false
-}
-
-func dedupeFaults(faultTypes []model.FaultType) []model.FaultType {
-	seen := make(map[model.FaultType]struct{}, len(faultTypes))
-	deduped := make([]model.FaultType, 0, len(faultTypes))
-	for _, faultType := range faultTypes {
-		if _, ok := seen[faultType]; ok {
-			continue
-		}
-		seen[faultType] = struct{}{}
-		deduped = append(deduped, faultType)
-	}
-	return deduped
-}
-
-func hasFault(asset *model.Asset, faultType model.FaultType) bool {
-	for _, active := range asset.ActiveFaults {
-		if active == faultType {
-			return true
-		}
-	}
-	return false
-}
-
-func setIfPresent(asset *model.Asset, metricName string, value float64) {
-	metric, ok := asset.Metrics[metricName]
-	if !ok {
-		return
-	}
-	metric.Value = value
-	asset.Metrics[metricName] = metric
 }
 
 func (m *Manager) randomBetween(minValue, maxValue float64) float64 {
+	if maxValue <= minValue {
+		return minValue
+	}
 	return minValue + m.rng.Float64()*(maxValue-minValue)
 }
 
@@ -604,15 +461,43 @@ func (m *Manager) round(value float64) float64 {
 func cloneAsset(asset *model.Asset) model.Asset {
 	clone := model.Asset{
 		AssetID:      asset.AssetID,
-		AssetType:    asset.AssetType,
+		AssetTypeID:  asset.AssetTypeID,
 		Status:       asset.Status,
-		Metrics:      make(map[string]model.MetricValue, len(asset.Metrics)),
-		ActiveFaults: make([]model.FaultType, 0, len(asset.ActiveFaults)),
+		Metrics:      make(model.MetricsMap, len(asset.Metrics)),
+		ActiveFaults: append([]string(nil), asset.ActiveFaults...),
 		UpdatedAt:    asset.UpdatedAt,
 	}
-	clone.ActiveFaults = append(clone.ActiveFaults, asset.ActiveFaults...)
+	if clone.ActiveFaults == nil {
+		clone.ActiveFaults = []string{}
+	}
 	for name, metric := range asset.Metrics {
 		clone.Metrics[name] = metric
 	}
 	return clone
+}
+
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	deduped := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		deduped = append(deduped, value)
+	}
+	return deduped
+}
+
+func stringInSlice(value string, values []string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
